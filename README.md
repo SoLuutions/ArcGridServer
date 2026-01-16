@@ -2,7 +2,7 @@
 
 Vercel serverless function for managing ARC Grid book access via Systeme.io integration.
 
-## Features
+## Featuress
 
 - ✅ Email validation and contact lookup
 - ✅ Automatic tag assignment for ARC Grid access
