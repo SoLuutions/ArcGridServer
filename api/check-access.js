@@ -48,18 +48,37 @@ export default async function handler(req, res) {
         const COURSE_ID = process.env.ARC_GRID_COURSE_ID;
         const REGISTRATION_URL = process.env.REGISTRATION_URL || 'https://commandresults.com/register';
         
-        if (!API_KEY || !TAG_ID || !COURSE_ID) {
-            console.error('Missing environment variables');
+        if (!API_KEY) {
+            console.error('Missing SYSTEME_API_KEY environment variable');
             return res.status(500).json({ 
                 success: false, 
-                message: 'Server configuration error' 
+                message: 'Server configuration error: Missing API key' 
             });
         }
+        
+        if (!TAG_ID) {
+            console.error('Missing ARC_GRID_TAG_ID environment variable');
+            return res.status(500).json({ 
+                success: false, 
+                message: 'Server configuration error: Missing tag ID' 
+            });
+        }
+        
+        if (!COURSE_ID) {
+            console.error('Missing ARC_GRID_COURSE_ID environment variable');
+            return res.status(500).json({ 
+                success: false, 
+                message: 'Server configuration error: Missing course ID' 
+            });
+        }
+        
+        console.log(`Processing request for email: ${email.substring(0, 5)}...`);
         
         // Step 1: Check if contact exists in Systeme.io
         const contact = await findContactByEmail(email, API_KEY);
         
         if (!contact) {
+            console.log(`Contact not found for email: ${email.substring(0, 5)}...`);
             // Contact doesn't exist - needs to register
             return res.status(200).json({
                 success: false,
@@ -69,18 +88,48 @@ export default async function handler(req, res) {
             });
         }
         
+        console.log(`Found contact ID: ${contact.id} for email: ${email.substring(0, 5)}...`);
+        
         // Step 2: Contact exists - add tag
-        const tagAdded = await addTagToContact(contact.id, TAG_ID, API_KEY);
+        let tagAdded = false;
+        try {
+            tagAdded = await addTagToContact(contact.id, TAG_ID, API_KEY);
+            console.log(`Tag ${TAG_ID} added to contact ${contact.id}: ${tagAdded}`);
+        } catch (tagError) {
+            console.error(`Error adding tag: ${tagError.message}`);
+            // Continue even if tag fails
+        }
         
         // Step 3: Enroll in course
-        const enrolled = await enrollInCourse(contact.id, COURSE_ID, API_KEY);
+        let enrolled = false;
+        try {
+            enrolled = await enrollInCourse(contact.id, COURSE_ID, API_KEY);
+            console.log(`Contact ${contact.id} enrolled in course ${COURSE_ID}: ${enrolled}`);
+        } catch (enrollError) {
+            console.error(`Error enrolling in course: ${enrollError.message}`);
+            // Continue even if enrollment fails
+        }
+        
+        // Step 4: Verify the contact has access to the course
+        let hasAccess = false;
+        try {
+            hasAccess = await verifyCourseAccess(contact.id, COURSE_ID, API_KEY);
+            console.log(`Contact ${contact.id} has access to course ${COURSE_ID}: ${hasAccess}`);
+        } catch (verifyError) {
+            console.error(`Error verifying course access: ${verifyError.message}`);
+            // Assume access was granted
+            hasAccess = true;
+        }
         
         return res.status(200).json({
             success: true,
             contactId: contact.id,
+            contactEmail: contact.email,
             tagAdded,
             enrolled,
-            message: 'Access granted to ARC Grid book'
+            hasAccess,
+            message: 'Access granted to ARC Grid book',
+            dashboardUrl: 'https://app.commandresults.com/school?tab=enrollments'
         });
         
     } catch (error) {
@@ -94,9 +143,17 @@ export default async function handler(req, res) {
             });
         }
         
+        if (error.message.includes('API Error')) {
+            return res.status(502).json({
+                success: false,
+                message: 'Unable to connect to the service. Please try again later.'
+            });
+        }
+        
         return res.status(500).json({
             success: false,
-            message: 'An error occurred while processing your request.'
+            message: 'An error occurred while processing your request.',
+            error: process.env.NODE_ENV === 'development' ? error.message : undefined
         });
     }
 }
@@ -110,7 +167,8 @@ async function findContactByEmail(email, apiKey) {
                 headers: {
                     'X-API-Key': apiKey,
                     'Content-Type': 'application/json'
-                }
+                },
+                timeout: 10000 // 10 second timeout
             }
         );
         
@@ -141,7 +199,8 @@ async function addTagToContact(contactId, tagId, apiKey) {
                     'X-API-Key': apiKey,
                     'Content-Type': 'application/json'
                 },
-                body: JSON.stringify({ tagId: parseInt(tagId) })
+                body: JSON.stringify({ tagId: parseInt(tagId) }),
+                timeout: 10000
             }
         );
         
@@ -150,7 +209,16 @@ async function addTagToContact(contactId, tagId, apiKey) {
             return true;
         }
         
-        console.warn(`Unexpected response when adding tag: ${response.status}`);
+        // Try to get error details
+        let errorMessage = `Unexpected response: ${response.status}`;
+        try {
+            const errorData = await response.json();
+            errorMessage += ` - ${JSON.stringify(errorData)}`;
+        } catch (e) {
+            // Ignore if no JSON body
+        }
+        
+        console.warn(`Tag add warning: ${errorMessage}`);
         return false;
         
     } catch (error) {
@@ -173,7 +241,8 @@ async function enrollInCourse(contactId, courseId, apiKey) {
                 body: JSON.stringify({
                     contactId: parseInt(contactId),
                     accessType: 'full_access'
-                })
+                }),
+                timeout: 10000
             }
         );
         
@@ -182,11 +251,57 @@ async function enrollInCourse(contactId, courseId, apiKey) {
             return true;
         }
         
-        console.warn(`Unexpected response when enrolling: ${response.status}`);
+        // Try to get error details
+        let errorMessage = `Unexpected response: ${response.status}`;
+        try {
+            const errorData = await response.json();
+            errorMessage += ` - ${JSON.stringify(errorData)}`;
+        } catch (e) {
+            // Ignore if no JSON body
+        }
+        
+        console.warn(`Enrollment warning: ${errorMessage}`);
         return false;
         
     } catch (error) {
         console.error('Error enrolling in course:', error);
+        return false;
+    }
+}
+
+// Helper function to verify course access
+async function verifyCourseAccess(contactId, courseId, apiKey) {
+    try {
+        // First, get enrollments for this contact
+        const response = await fetch(
+            `https://api.systeme.io/api/school/enrollments?contact=${contactId}&limit=100`,
+            {
+                headers: {
+                    'X-API-Key': apiKey,
+                    'Content-Type': 'application/json'
+                },
+                timeout: 10000
+            }
+        );
+        
+        if (!response.ok) {
+            console.warn(`Failed to fetch enrollments: ${response.status}`);
+            return false;
+        }
+        
+        const data = await response.json();
+        
+        // Check if any enrollment is for our course
+        if (data.items && Array.isArray(data.items)) {
+            return data.items.some(enrollment => 
+                enrollment.course && enrollment.course.id === courseId
+            );
+        }
+        
+        return false;
+        
+    } catch (error) {
+        console.error('Error verifying course access:', error);
         return false;
     }
 }
